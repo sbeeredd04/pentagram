@@ -1,19 +1,32 @@
 import io
+import base64
 import modal
 import time
-from pathlib import Path
 import random
+from pathlib import Path
+from fastapi import HTTPException, Request
+from fastapi.responses import JSONResponse
+from huggingface_hub import login
 
 # Define constants
 MINUTES = 60
 
-# Import dependencies
-from huggingface_hub import login
+# Login to HuggingFace
 login(token='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')
 
-# Create Modal app
-app = modal.App("simple-text-to-image")
+# Predefine the model ID
+model_id = "stabilityai/stable-diffusion-3.5-large"
 
+# Named function to pre-download the model during the build phase
+def download_model():
+    from diffusers import StableDiffusion3Pipeline
+    import torch
+    StableDiffusion3Pipeline.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,  # Corrected the dtype
+    ).save_pretrained("/model")
+
+# Build the Modal app and pre-download the model during the build phase
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
@@ -26,62 +39,69 @@ image = (
         "torchvision==0.20.1",
         "transformers~=4.44.0",
     )
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})  # faster downloads
+    .run_function(download_model)
 )
 
-with image.imports():
-    import diffusers
-    import torch
-    from fastapi import Response
-    from diffusers import StableDiffusion3Pipeline
-
-model_id = "stabilityai/stable-diffusion-3.5-large"
+app = modal.App("simple-text-to-image")
 
 @app.cls(
     image=image,
     gpu="A100",
     timeout=10 * MINUTES,
+    keep_warm=1  # Keep at least 1 container warm to reduce cold starts
 )
 class Inference:
-    @modal.build()
     @modal.enter()
     def initialize(self):
-        self.pipe = diffusers.StableDiffusion3Pipeline.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
+        # Load the pre-saved model from the build phase
+        from diffusers import StableDiffusion3Pipeline
+        import torch
+        print("Initializing model...")
+        self.pipe = StableDiffusion3Pipeline.from_pretrained(
+            "/model",
+            torch_dtype=torch.bfloat16,  # Corrected the dtype
         )
-
-    @modal.enter()
-    def move_to_gpu(self):
         self.pipe.to("cuda")
+        print("Model loaded onto GPU.")
 
     @modal.method()
-    def run( self, prompt: str, batch_size: int = 1, seed: int = None ) -> list[bytes]:
+    def run(self, prompt: str, batch_size: int = 1) -> bytes:
+        import torch
         
-        seed = seed if seed is not None else random.randint(0, 2**32 - 1)
-        print("seeding RNG with", seed)
-        torch.manual_seed(seed)
-
+        # Generate images
         images = self.pipe(
             prompt,
             num_images_per_prompt=batch_size,
-            num_inference_steps=28,  
-            guidance_scale=3.5, 
+            num_inference_steps=16,  # Reduced for faster response
+            guidance_scale=3.5,  # Balanced guidance scale
         ).images
 
-        image_output = []
-        for image in images:
-            with io.BytesIO() as buf:
-                image.save(buf, format="PNG")
-                image_output.append(buf.getvalue())
-        torch.cuda.empty_cache()  # reduce fragmentation
-        return image_output
+        # Convert the first image to PNG format and encode it as Base64
+        with io.BytesIO() as buf:
+            images[0].save(buf, format="PNG")
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    @modal.web_endpoint(docs=True)
-    def web(self, prompt="A beautiful ocean with a sunset and a cute racoon", seed: int = None):
-        return Response(
-            content=self.run.local(  # run in the same container
-                prompt, batch_size=1, seed=seed
-            )[0],
-            media_type="image/png",
-        )
+    @modal.web_endpoint(method="POST", docs=True)
+    async def web(self, request: Request):
+        # Parse the JSON payload for the prompt
+        data = await request.json()
+        prompt = data.get("text")
+        if not prompt:
+            raise HTTPException(status_code=400, detail="Prompt is required")
+        
+        # Generate the image and return it as Base64-encoded data
+        image_base64 = self.run.local(prompt, batch_size=1)
+        return JSONResponse(content={"image": image_base64})
+
+# Dynamic scaling of warm containers based on traffic
+@app.function(schedule=modal.Cron("0 * * * *"))
+def adjust_keep_warm():
+    from datetime import datetime, timezone
+
+    # Define peak hours
+    peak_hours_start, peak_hours_end = 6, 18
+    current_hour = datetime.now(timezone.utc).hour
+    if peak_hours_start <= current_hour < peak_hours_end:
+        Inference.keep_warm(2)  # Keep more containers warm during peak hours
+    else:
+        Inference.keep_warm(1)  # Fewer containers during off-peak hours
